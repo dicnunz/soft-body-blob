@@ -1,0 +1,530 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no" />
+<title>Soft Body Blob</title>
+<style>
+  html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#c7c6c1;touch-action:none}
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;cursor:grab;user-select:none}
+  body.grabbing{cursor:grabbing}
+  canvas{display:block;width:100%;height:100%}
+  #hint{position:fixed;left:18px;bottom:16px;color:rgba(25,25,23,.62);font-size:12px;line-height:1;letter-spacing:.015em;pointer-events:none;transition:opacity .7s ease}
+  #reset{position:fixed;right:15px;bottom:11px;border:0;background:transparent;color:rgba(25,25,23,.50);font:500 12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;padding:7px;cursor:pointer}
+  #reset:hover,#reset:focus-visible{color:rgba(25,25,23,.9);outline:none}
+  @media (prefers-reduced-motion: reduce){#hint{transition:none}}
+</style>
+</head>
+<body>
+<canvas id="c" aria-label="Interactive translucent soft body. Drag it to stretch and tear it apart."></canvas>
+<div id="hint">drag · stretch · tear</div>
+<button id="reset" type="button" aria-label="Reset soft body">reset</button>
+<script>
+(() => {
+'use strict';
+
+/*
+  RESEARCH-TO-SYSTEM MAPPING
+  --------------------------
+  The original Evangelion TV/EoE mechanical lineage is translated structurally, not cosmetically:
+  - 00 prototype: intentionally uneven early lattice near the nucleus.
+  - 01 test type: a living compliant body held by a distinctly stiffer outer restraint network.
+  - 02 production type: redundant cross-bracing that stabilizes ordinary deformation.
+  - 03/04 incidents: local overload can cascade instead of failing as one clean cartoon cut.
+  - 05–13 mass-production series: torn pieces remain complete simulated bodies rather than particles vanishing.
+  The visible material is deliberately not an Eva palette. It is a water-rich gelatin-like hydrogel under studio light.
+  Physics is a real-time XPBD-inspired approximation, not a claim of exact continuum/FEM equivalence.
+*/
+
+const canvas = document.getElementById('c');
+const hint = document.getElementById('hint');
+const resetBtn = document.getElementById('reset');
+const gl = canvas.getContext('webgl2', {antialias:false, alpha:false, depth:false, stencil:false, preserveDrawingBuffer:false});
+
+const MAXP = 68;
+const gravity = 9.81;
+const floorY = 0.58;
+const worldHalfWidth = 0.62;
+const R = 0.145;
+const spacing = 0.034;
+const totalMass = 0.92; // kg-scale target; distributed over the particle lattice
+const FIXED = 1/180;
+const SOLVER_ITERS = 7;
+const MAX_FRAME = 1/24;
+
+let particles = [];
+let constraints = [];
+let grab = null;
+let mouseWorld = {x:0,y:0};
+let mousePixel = {x:-9999,y:-9999};
+let pointerDown = false;
+let accumulator = 0;
+let lastT = performance.now()/1000;
+let firstTouch = false;
+let simTime = 0;
+let brokenCount = 0;
+
+function makeBlob(){
+  particles.length = 0;
+  constraints.length = 0;
+  brokenCount = 0;
+  grab = null;
+  pointerDown = false;
+  document.body.classList.remove('grabbing');
+
+  const cx = 0, cy = 0.245;
+  let row = 0;
+  for(let y=-R; y<=R+1e-6; y += spacing*Math.sqrt(3)/2, row++){
+    const off = (row&1) ? spacing/2 : 0;
+    for(let x=-R; x<=R+1e-6; x += spacing){
+      const xx = x + off;
+      // Slightly non-circular initial contour: tall, compressed silhouette without literal Eva anatomy.
+      const ex = xx/0.93, ey = y/1.06;
+      if(ex*ex + ey*ey <= R*R){
+        const rr = Math.hypot(ex,ey)/R;
+        const id = particles.length;
+        particles.push({
+          id,
+          x:cx+xx, y:cy+y,
+          ox:cx+xx, oy:cy+y,
+          vx:0, vy:0,
+          invMass:1,
+          radial:rr,
+          strain:0,
+          shell:rr>0.72,
+          contact:0
+        });
+      }
+    }
+  }
+  const m = totalMass / particles.length;
+  for(const p of particles) p.invMass = 1/m;
+
+  for(let i=0;i<particles.length;i++){
+    for(let j=i+1;j<particles.length;j++){
+      const a=particles[i], b=particles[j];
+      const d=Math.hypot(a.x-b.x,a.y-b.y);
+      let kind = null;
+      if(d < spacing*1.12) kind='struct';
+      else if(d < spacing*1.82) kind='brace';
+      if(!kind) continue;
+
+      const bothShell = a.radial>0.69 && b.radial>0.69;
+      const corePrototype = a.radial<0.30 || b.radial<0.30;
+      let compliance, tear;
+      if(kind==='struct'){
+        if(bothShell){ compliance = 0.0015; tear = 0.14; }
+        else if(corePrototype){
+          // Small calibrated irregularity, representing prototype instability as material variance.
+          const wobble = 0.84 + 0.28 * hash(i*91+j*17);
+          compliance = 0.007*wobble; tear = 0.30;
+        } else { compliance = 0.006; tear = 0.24; }
+      } else {
+        compliance = bothShell ? 0.012 : 0.03;
+        tear = bothShell ? 0.18 : 0.35;
+      }
+      constraints.push({i,j,rest:d,compliance,tear,damage:0,broken:false,lambda:0,kind,bothShell});
+    }
+  }
+
+  // Production-type redundancy: sparse long braces, deliberately absent from the very center.
+  for(let i=0;i<particles.length;i++){
+    for(let j=i+1;j<particles.length;j++){
+      const a=particles[i], b=particles[j];
+      const d=Math.hypot(a.x-b.x,a.y-b.y);
+      if(d > spacing*1.88 && d < spacing*2.18 && a.radial>0.28 && b.radial>0.28){
+        if(((i*31+j*17)%5)===0){
+          constraints.push({i,j,rest:d,compliance:0.05,tear:0.45,damage:0,broken:false,lambda:0,kind:'long',bothShell:false});
+        }
+      }
+    }
+  }
+}
+
+function hash(n){
+  const x = Math.sin(n*12.9898+78.233)*43758.5453;
+  return x-Math.floor(x);
+}
+
+function resize(){
+  const cssW = innerWidth, cssH = innerHeight;
+  // Cap shader work so a laptop stays responsive while keeping enough pixel density for specular detail.
+  const targetScale = Math.min(devicePixelRatio || 1, 1.7, 1280/cssW, 900/cssH);
+  const w = Math.max(2, Math.round(cssW*targetScale));
+  const h = Math.max(2, Math.round(cssH*targetScale));
+  if(canvas.width!==w || canvas.height!==h){
+    canvas.width=w; canvas.height=h;
+    if(gl) gl.viewport(0,0,w,h);
+  }
+}
+
+function projection(){
+  const w=canvas.width,h=canvas.height;
+  const ppm = Math.min(w/1.22, h/0.86);
+  const floorPx = h*0.805;
+  return {w,h,ppm,floorPx,cx:w*0.5};
+}
+function worldToPixel(x,y){
+  const q=projection();
+  return {x:q.cx+x*q.ppm, y:q.floorPx+(y-floorY)*q.ppm};
+}
+function pixelToWorld(x,y){
+  const q=projection();
+  return {x:(x-q.cx)/q.ppm, y:floorY+(y-q.floorPx)/q.ppm};
+}
+function eventToPixel(e){
+  const r=canvas.getBoundingClientRect();
+  return {x:(e.clientX-r.left)*canvas.width/r.width, y:(e.clientY-r.top)*canvas.height/r.height};
+}
+
+function beginGrab(e){
+  if(e.button!==undefined && e.button!==0) return;
+  const pp=eventToPixel(e);
+  mousePixel=pp;
+  mouseWorld=pixelToWorld(pp.x,pp.y);
+  let near=[];
+  for(const p of particles){
+    const d=Math.hypot(p.x-mouseWorld.x,p.y-mouseWorld.y);
+    if(d<0.075) near.push({p,d});
+  }
+  near.sort((a,b)=>a.d-b.d);
+  if(!near.length || near[0].d>0.055) return;
+  const chosen=near.slice(0, Math.min(4,near.length));
+  grab = chosen.map(({p,d})=>({
+    id:p.id,
+    ox:p.x-mouseWorld.x,
+    oy:p.y-mouseWorld.y,
+    w:Math.exp(-(d*d)/(2*0.038*0.038)),
+    lambdaX:0,lambdaY:0
+  }));
+  pointerDown=true;
+  canvas.setPointerCapture?.(e.pointerId);
+  document.body.classList.add('grabbing');
+  if(!firstTouch){firstTouch=true; hint.style.opacity='0';}
+}
+function moveGrab(e){
+  const pp=eventToPixel(e);
+  mousePixel=pp;
+  mouseWorld=pixelToWorld(pp.x,pp.y);
+}
+function endGrab(e){
+  pointerDown=false;
+  grab=null;
+  document.body.classList.remove('grabbing');
+  try{canvas.releasePointerCapture?.(e.pointerId)}catch(_){ }
+}
+canvas.addEventListener('pointerdown',beginGrab);
+canvas.addEventListener('pointermove',moveGrab);
+canvas.addEventListener('pointerup',endGrab);
+canvas.addEventListener('pointercancel',endGrab);
+canvas.addEventListener('contextmenu',e=>e.preventDefault());
+resetBtn.addEventListener('click',()=>makeBlob());
+addEventListener('keydown',e=>{ if(e.key==='r'||e.key==='R') makeBlob(); });
+addEventListener('resize',resize,{passive:true});
+
+function solveDistance(c,dt){
+  if(c.broken) return;
+  const a=particles[c.i], b=particles[c.j];
+  let dx=b.x-a.x, dy=b.y-a.y;
+  const len=Math.hypot(dx,dy) || 1e-8;
+  const nx=dx/len, ny=dy/len;
+  const C=len-c.rest;
+  const alpha=c.compliance/(dt*dt);
+  const w=a.invMass+b.invMass;
+  const dl=(-C-alpha*c.lambda)/(w+alpha);
+  c.lambda += dl;
+  a.x -= a.invMass*dl*nx;
+  a.y -= a.invMass*dl*ny;
+  b.x += b.invMass*dl*nx;
+  b.y += b.invMass*dl*ny;
+
+  const strain=len/c.rest-1;
+  if(strain>c.tear){
+    // Failure needs duration, producing crack initiation and arrest rather than instant confetti.
+    const load = Math.pow((strain-c.tear)/Math.max(0.08,c.tear),1.25);
+    c.damage += load*dt*(pointerDown?14.0:1.2); if(pointerDown && strain>c.tear*1.22) c.damage=1.05;
+    if(strain>c.tear*2.25) c.damage += dt*12;
+    if(c.damage>1){c.broken=true; brokenCount++;}
+  } else {
+    c.damage=Math.max(0,c.damage-dt*0.11);
+  }
+}
+
+function solveGrab(dt){
+  if(!grab) return;
+  const compliance=0.000006;
+  const alpha=compliance/(dt*dt);
+  for(const g of grab){
+    const p=particles[g.id];
+    const tx=mouseWorld.x+g.ox, ty=mouseWorld.y+g.oy;
+    let C=p.x-tx;
+    let dl=(-C-alpha*g.lambdaX)/(p.invMass+alpha);
+    g.lambdaX+=dl; p.x+=p.invMass*dl*g.w;
+    C=p.y-ty;
+    dl=(-C-alpha*g.lambdaY)/(p.invMass+alpha);
+    g.lambdaY+=dl; p.y+=p.invMass*dl*g.w;
+  }
+}
+
+function solveCollisions(){
+  const rad=0.0115;
+  const minD=rad*2;
+  // Particle contact keeps torn bodies from tunnelling through themselves without forcing a rigid mesh.
+  for(let i=0;i<particles.length;i++){
+    const a=particles[i];
+    if(a.y>floorY-rad){ a.y=floorY-rad; a.contact=1; if(Number.isFinite(a.stepX)) a.x=a.stepX+(a.x-a.stepX)*0.38; }
+    if(a.x < -worldHalfWidth+rad) a.x=-worldHalfWidth+rad;
+    if(a.x >  worldHalfWidth-rad) a.x= worldHalfWidth-rad;
+  }
+  for(let i=0;i<particles.length;i++){
+    for(let j=i+1;j<particles.length;j++){
+      const a=particles[i],b=particles[j];
+      let dx=b.x-a.x,dy=b.y-a.y;
+      const d2=dx*dx+dy*dy;
+      if(d2>0 && d2<minD*minD){
+        const d=Math.sqrt(d2), pen=minD-d;
+        dx/=d;dy/=d;
+        const wi=a.invMass, wj=b.invMass, inv=1/(wi+wj);
+        a.x-=dx*pen*wi*inv*0.5; a.y-=dy*pen*wi*inv*0.5;
+        b.x+=dx*pen*wj*inv*0.5; b.y+=dy*pen*wj*inv*0.5;
+      }
+    }
+  }
+}
+
+function physicsStep(dt){
+  simTime += dt;
+  const oldX=new Float64Array(particles.length), oldY=new Float64Array(particles.length);
+  for(let i=0;i<particles.length;i++){
+    const p=particles[i]; oldX[i]=p.x; oldY[i]=p.y; p.stepX=p.x; p.contact=0;
+    p.vy += gravity*dt;
+    // Air damping at a scale suitable for a hand-sized wet gel.
+    p.vx *= 0.9992; p.vy *= 0.9992;
+    p.x += p.vx*dt; p.y += p.vy*dt;
+  }
+  for(const c of constraints)c.lambda=0;
+  if(grab) for(const g of grab){g.lambdaX=0;g.lambdaY=0;}
+  for(let k=0;k<SOLVER_ITERS;k++){
+    for(const c of constraints) solveDistance(c,dt);
+    solveGrab(dt);
+    solveCollisions();
+  }
+  for(let i=0;i<particles.length;i++){
+    const p=particles[i];
+    p.vx=(p.x-oldX[i])/dt;
+    p.vy=(p.y-oldY[i])/dt;
+    if(p.contact){ p.vx*=0.35; if(p.vy>0)p.vy*=-0.055; }
+  }
+  // Local strain drives internal absorption in the renderer.
+  const counts=new Float32Array(particles.length);
+  for(const p of particles)p.strain*=0.82;
+  for(const c of constraints){
+    if(c.broken)continue;
+    const a=particles[c.i],b=particles[c.j];
+    const s=Math.max(0,Math.hypot(a.x-b.x,a.y-b.y)/c.rest-1);
+    a.strain+=s;b.strain+=s;counts[c.i]++;counts[c.j]++;
+  }
+  for(let i=0;i<particles.length;i++) if(counts[i]) particles[i].strain=Math.min(2.2,particles[i].strain/counts[i]*1.65);
+}
+
+let program=null, uniforms={};
+if(gl){
+  const vs=`#version 300 es
+  precision highp float;
+  void main(){
+    vec2 p=vec2(float((gl_VertexID<<1)&2), float(gl_VertexID&2));
+    gl_Position=vec4(p*2.0-1.0,0.0,1.0);
+  }`;
+  const fs=`#version 300 es
+  precision highp float;
+  #define MAXP ${MAXP}
+  uniform vec2 uRes;
+  uniform vec4 uP[MAXP];
+  uniform int uCount;
+  uniform float uFloor;
+  uniform float uTime;
+  uniform vec2 uMouse;
+  uniform float uGrab;
+  out vec4 outColor;
+
+  float hash21(vec2 p){
+    p=fract(p*vec2(123.34,456.21));p+=dot(p,p+45.32);return fract(p.x*p.y);
+  }
+  vec3 background(vec2 q){
+    float y=q.y/uRes.y;
+    float wall=mix(0.84,0.69,smoothstep(0.02,0.82,y));
+    vec3 col=vec3(wall*1.015,wall*1.01,wall*0.985);
+    // Large soft source at upper left; its reflection gives the gel a readable real-world surface.
+    vec2 lp=(q-vec2(uRes.x*0.25,uRes.y*0.17))/vec2(uRes.x*0.30,uRes.y*0.24);
+    col+=vec3(0.105,0.102,0.095)*exp(-dot(lp,lp)*1.6);
+    if(q.y>uFloor){
+      float fy=(q.y-uFloor)/(uRes.y-uFloor+1.0);
+      vec3 floorCol=mix(vec3(0.655,0.648,0.625),vec3(0.57,0.565,0.545),fy);
+      float seam=exp(-abs(q.y-uFloor)*0.12);
+      col=mix(col,floorCol,smoothstep(uFloor-1.0,uFloor+1.0,q.y));
+      col-=seam*0.026;
+    }
+    float n=(hash21(floor(q*0.53))-0.5)*0.006;
+    return col+n;
+  }
+
+  void fieldAt(vec2 q, out float f, out vec2 grad, out float strain, out float shadow){
+    f=0.0;grad=vec2(0.0);strain=0.0;shadow=0.0;
+    float sw=0.0;
+    for(int i=0;i<MAXP;i++){
+      if(i>=uCount)break;
+      vec4 p=uP[i];
+      vec2 d=q-p.xy;
+      float r=p.z;
+      float d2=dot(d,d);
+      if(d2<r*r*34.0){
+        float den=d2+r*r*0.42;
+        float v=(r*r)/den;
+        f+=v;
+        grad+=(-2.0*r*r*d)/(den*den);
+        strain+=p.w*v; sw+=v;
+      }
+      // Matte-floor contact shadow, projected from each mass point.
+      vec2 ds=vec2((q.x-p.x)/(r*2.6),(q.y-uFloor)/(r*0.55));
+      if(q.y>uFloor-10.0 && abs(ds.x)<4.0 && abs(ds.y)<4.0){
+        shadow += exp(-dot(ds,ds)*1.75)*smoothstep(uFloor-95.0,uFloor,p.y);
+      }
+    }
+    strain=sw>0.0?strain/sw:0.0;
+  }
+
+  void main(){
+    vec2 q=vec2(gl_FragCoord.x,uRes.y-gl_FragCoord.y);
+    float f;vec2 g;float strain;float shadow;
+    fieldAt(q,f,g,strain,shadow);
+    const float iso=1.22;
+    float aa=max(fwidth(f)*1.15,0.012);
+    float alpha=smoothstep(iso-aa,iso+aa,f);
+    vec3 bg=background(q);
+    if(alpha<0.002){
+      bg*=1.0-min(0.20,shadow*0.035);
+      outColor=vec4(bg,1.0);return;
+    }
+
+    float gm=max(length(g),1e-6);
+    vec2 gn=g/gm;
+    float depth=clamp((f-iso)*0.53,0.0,1.0);
+    float nz=mix(0.34,0.98,smoothstep(0.0,0.88,depth));
+    vec3 N=normalize(vec3(-gn.x,gn.y,nz));
+    vec3 V=vec3(0.0,0.0,1.0);
+    vec3 L=normalize(vec3(-0.45,-0.65,0.80));
+
+    // n≈1.34 hydrogel Fresnel at normal incidence.
+    float F0=0.0212;
+    float ndv=clamp(dot(N,V),0.0,1.0);
+    float fres=F0+(1.0-F0)*pow(1.0-ndv,5.0);
+    vec2 refrOff=N.xy*(5.5+13.0*depth);
+    vec3 transmitted=background(q-refrOff);
+
+    float thick=smoothstep(0.0,1.0,depth);
+    vec3 clearAbsorb=vec3(0.965,0.982,0.958);
+    // Mechanical overload becomes physically legible as deeper, warmer absorption instead of an Eva color code.
+    float s=clamp(strain*0.72,0.0,1.0);
+    vec3 stressAbsorb=mix(clearAbsorb,vec3(0.77,0.50,0.43),s*s);
+    vec3 body=transmitted*mix(vec3(1.0),stressAbsorb,0.24+0.49*thick);
+
+    float ndl=max(dot(N,L),0.0);
+    vec3 H=normalize(L+V);
+    float rough=mix(0.12,0.24,s);
+    float specPow=mix(180.0,72.0,rough);
+    float spec=pow(max(dot(N,H),0.0),specPow)*(0.70+0.32*(1.0-s));
+    float broad=pow(max(dot(N,H),0.0),18.0)*0.075;
+    float subsurface=pow(max(dot(-N,L),0.0),1.6)*(0.075+0.10*thick);
+
+    vec3 reflected=mix(vec3(0.18),vec3(0.98,0.985,0.97),pow(max(dot(reflect(-V,N),L),0.0),8.0));
+    vec3 col=body*(0.93+0.10*ndl)+vec3(1.0,0.985,0.95)*(spec+broad)+vec3(0.98,0.63,0.50)*subsurface*s;
+    col=mix(col,reflected,fres*0.86);
+
+    // Fine wet-surface microvariation, far below the deformation scale.
+    float micro=(hash21(q*0.92+uTime*0.007)-0.5)*0.006;
+    col+=micro;
+    col*=1.0-min(0.12,shadow*0.015);
+
+    // Pointer contributes only a real-looking local highlight when actively coupled to the material.
+    if(uGrab>0.5){
+      float md=length(q-uMouse);
+      col+=vec3(1.0)*exp(-md*md/1800.0)*0.018*alpha;
+    }
+    outColor=vec4(mix(bg,col,alpha),1.0);
+  }`;
+
+  function compile(type,src){
+    const s=gl.createShader(type); gl.shaderSource(s,src); gl.compileShader(s);
+    if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+    return s;
+  }
+  try{
+    program=gl.createProgram();
+    gl.attachShader(program,compile(gl.VERTEX_SHADER,vs));
+    gl.attachShader(program,compile(gl.FRAGMENT_SHADER,fs));
+    gl.linkProgram(program);
+    if(!gl.getProgramParameter(program,gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program));
+    uniforms.res=gl.getUniformLocation(program,'uRes');
+    uniforms.ps=gl.getUniformLocation(program,'uP[0]');
+    uniforms.count=gl.getUniformLocation(program,'uCount');
+    uniforms.floor=gl.getUniformLocation(program,'uFloor');
+    uniforms.time=gl.getUniformLocation(program,'uTime');
+    uniforms.mouse=gl.getUniformLocation(program,'uMouse');
+    uniforms.grab=gl.getUniformLocation(program,'uGrab');
+  }catch(err){console.error(err);program=null;}
+}
+
+function renderGL(){
+  const q=projection();
+  gl.useProgram(program);
+  gl.uniform2f(uniforms.res,q.w,q.h);
+  gl.uniform1i(uniforms.count,Math.min(particles.length,MAXP));
+  gl.uniform1f(uniforms.floor,q.floorPx);
+  gl.uniform1f(uniforms.time,simTime);
+  gl.uniform2f(uniforms.mouse,mousePixel.x,mousePixel.y);
+  gl.uniform1f(uniforms.grab,pointerDown?1:0);
+  const arr=new Float32Array(MAXP*4);
+  const pr=spacing*q.ppm*0.88;
+  for(let i=0;i<Math.min(particles.length,MAXP);i++){
+    const p=particles[i], sp=worldToPixel(p.x,p.y);
+    arr[i*4]=sp.x;arr[i*4+1]=sp.y;arr[i*4+2]=pr;arr[i*4+3]=p.strain;
+  }
+  gl.uniform4fv(uniforms.ps,arr);
+  gl.drawArrays(gl.TRIANGLES,0,3);
+}
+
+function renderFallback(){
+  const ctx=canvas.getContext('2d');
+  if(!ctx)return;
+  const q=projection();
+  const grad=ctx.createLinearGradient(0,0,0,q.h);grad.addColorStop(0,'#d7d6d1');grad.addColorStop(1,'#98978f');
+  ctx.fillStyle=grad;ctx.fillRect(0,0,q.w,q.h);
+  ctx.fillStyle='rgba(30,28,24,.10)';ctx.fillRect(0,q.floorPx,q.w,q.h-q.floorPx);
+  ctx.globalCompositeOperation='source-over';
+  const r=spacing*q.ppm*1.18;
+  for(const p of particles){
+    const s=worldToPixel(p.x,p.y);
+    const g=ctx.createRadialGradient(s.x-r*.35,s.y-r*.45,r*.1,s.x,s.y,r);
+    g.addColorStop(0,'rgba(255,255,245,.88)');g.addColorStop(.65,'rgba(184,199,184,.58)');g.addColorStop(1,'rgba(125,135,124,.08)');
+    ctx.fillStyle=g;ctx.beginPath();ctx.arc(s.x,s.y,r,0,Math.PI*2);ctx.fill();
+  }
+}
+
+function frame(tms){
+  resize();
+  const now=tms/1000;
+  let dt=Math.min(MAX_FRAME,Math.max(0,now-lastT)); lastT=now;
+  accumulator+=dt;
+  let n=0;
+  while(accumulator>=FIXED && n<8){physicsStep(FIXED);accumulator-=FIXED;n++;}
+  if(program)renderGL(); else renderFallback();
+  requestAnimationFrame(frame);
+}
+
+resize();
+makeBlob();
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
